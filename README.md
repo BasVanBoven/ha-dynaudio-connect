@@ -18,6 +18,6 @@ media_player:
 * Expand update function to reflect device state
 * Volume up/down
 
-## Licence
+## License
 This project is licensed under [MIT license](http://opensource.org/licenses/MIT).
 For the full text of the license, see the [LICENSE.md](LICENSE.md) file.
