@@ -102,6 +102,31 @@ class DynaudioEntity(MediaPlayerEntity):
           self._selected_source=self._source_number_to_name[received[8]]
           self._muted=bool(received[10])
           self._pwstate=bool(received[6])
+          #if (int(received[3], 16) == int("2e", 16)) & (int(received[4], 16) == int("a0", 16)):
+          """if True:
+            _LOGGER.warning("Update trigger!")
+            r_zone = int(received[7]) % 10
+            r_input = int(received[7]) / 10
+            if (r_zone != self._zone):
+              _LOGGER.warning("Received feedback of wrong zone", r_zone)
+            else:
+              # always update source
+              self._selected_source = self._source_number_to_name[r_input]
+              # update power if possible
+              if (int(received[5]) == 1):
+                self._pwstate = True
+                _LOGGER.warning("Power on!")
+              elif (int(received[5]) == 2):
+                self._pwstate = False
+                _LOGGER.warning("Power off!")
+              # update volume if possible
+              elif (int(received[5]) == 4) or (int(received[5]) == 5):
+                _LOGGER.warning("Volume update")
+                self._volume = float(min((int(received[6]) / self._max_volume),1))
+              # update mute if possible
+              elif (int(received[5]) == 3):
+                _LOGGER.warning("Mote update!")
+                self._muted = bool(received[6], 16)"""
         s.shutdown(socket.SHUT_RDWR)
         s.close()
     except (ConnectionRefusedError):
@@ -189,7 +214,7 @@ class DynaudioEntity(MediaPlayerEntity):
     self.socket_command(
       "2F A0 13 " +
       str(hex(round(volume * self._max_volume))[2:]).zfill(2) +
-      " 5" + str(self._zone))
+      " " + str(self._source_name_to_number[self._selected_source]) + str(self._zone))
 
   def mute_volume(self, mute):
     """Toggles mute of media player (regardless of bool mute)"""
@@ -200,4 +225,4 @@ class DynaudioEntity(MediaPlayerEntity):
     self.socket_command(
       "2F A0 15 " +
       str(self._source_name_to_number.get(source)).zfill(2) +
-      " 5" + str(self._zone))
+      " " + str(self._source_name_to_number[self._selected_source]) + str(self._zone))
