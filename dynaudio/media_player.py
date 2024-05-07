@@ -14,8 +14,7 @@ import voluptuous as vol
 from homeassistant.components.media_player import (
   MediaPlayerEntity, PLATFORM_SCHEMA)
 from homeassistant.components.media_player.const import (
-  SUPPORT_TURN_OFF, SUPPORT_TURN_ON, SUPPORT_SELECT_SOURCE,
-  SUPPORT_VOLUME_MUTE, SUPPORT_VOLUME_SET)
+  MediaPlayerEntityFeature)
 from homeassistant.const import (
   CONF_HOST, CONF_NAME, CONF_PORT, STATE_OFF, STATE_ON)
 import homeassistant.helpers.config_validation as cv
@@ -27,8 +26,10 @@ DEFAULT_PORT = 1901
 DEFAULT_MAX_VOLUME = 31
 DEFAULT_STANDARD_ZONE = 1
 
-SUPPORT_DYNAUDIO = SUPPORT_VOLUME_SET | SUPPORT_VOLUME_MUTE | \
-  SUPPORT_TURN_ON | SUPPORT_TURN_OFF | SUPPORT_SELECT_SOURCE
+SUPPORT_DYNAUDIO = MediaPlayerEntityFeature.VOLUME_SET|MediaPlayerEntityFeature.VOLUME_MUTE| \
+MediaPlayerEntityFeature.TURN_ON|MediaPlayerEntityFeature.TURN_OFF|MediaPlayerEntityFeature.SELECT_SOURCE
+"""SUPPORT_DYNAUDIO = SUPPORT_VOLUME_SET | SUPPORT_VOLUME_MUTE | \
+  SUPPORT_TURN_ON | SUPPORT_TURN_OFF | SUPPORT_SELECT_SOURCE"""
 
 CONF_MAX_VOLUME = "max_volume"
 CONF_DEFAULT_STANDARD_ZONE = "default_zone"
