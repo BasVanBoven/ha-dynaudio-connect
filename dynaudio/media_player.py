@@ -5,18 +5,17 @@ Based on the API documentation found here:
 https://github.com/therealmuffin/Dynaudio-connect-api
 """
 
+from datetime import timedelta
 import logging
 import math
 import socket
 import threading
+
 import voluptuous as vol
 
-from homeassistant.components.media_player import (
-  MediaPlayerEntity, PLATFORM_SCHEMA)
-from homeassistant.components.media_player.const import (
-  MediaPlayerEntityFeature)
-from homeassistant.const import (
-  CONF_HOST, CONF_NAME, CONF_PORT, STATE_OFF, STATE_ON)
+from homeassistant.components.media_player import MediaPlayerEntity, PLATFORM_SCHEMA
+from homeassistant.components.media_player.const import MediaPlayerEntityFeature
+from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, STATE_OFF, STATE_ON
 import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,204 +25,234 @@ DEFAULT_PORT = 1901
 DEFAULT_MAX_VOLUME = 31
 DEFAULT_STANDARD_ZONE = 1
 
-SUPPORT_DYNAUDIO = MediaPlayerEntityFeature.VOLUME_SET|MediaPlayerEntityFeature.VOLUME_MUTE| \
-MediaPlayerEntityFeature.TURN_ON|MediaPlayerEntityFeature.TURN_OFF|MediaPlayerEntityFeature.SELECT_SOURCE
-"""SUPPORT_DYNAUDIO = SUPPORT_VOLUME_SET | SUPPORT_VOLUME_MUTE | \
-  SUPPORT_TURN_ON | SUPPORT_TURN_OFF | SUPPORT_SELECT_SOURCE"""
+# Poll less often; every poll opens a new connection and sends a command.
+SCAN_INTERVAL = timedelta(seconds=60)
+
+SOCKET_TIMEOUT = 2
+LOCK_TIMEOUT = 0.25
 
 CONF_MAX_VOLUME = "max_volume"
 CONF_DEFAULT_STANDARD_ZONE = "default_zone"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_HOST): cv.string,
-    vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-    vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-    vol.Optional(CONF_MAX_VOLUME, default=DEFAULT_MAX_VOLUME): cv.positive_int,
-    vol.Optional(CONF_DEFAULT_STANDARD_ZONE, default=DEFAULT_STANDARD_ZONE): cv.positive_int
-})
+SUPPORT_DYNAUDIO = (
+    MediaPlayerEntityFeature.VOLUME_SET
+    | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.TURN_ON
+    | MediaPlayerEntityFeature.TURN_OFF
+    | MediaPlayerEntityFeature.SELECT_SOURCE
+)
+
+SOURCES = {
+    "Minijack": 1,
+    "Line": 2,
+    "Optical": 3,
+    "Coax": 4,
+    "USB": 5,
+    "Bluetooth": 6,
+    "Stream": 7,
+}
+SOURCE_NAMES = {number: name for name, number in SOURCES.items()}
+
+
+def ipv4_address(value):
+    """Require a numeric address so DNS cannot block a socket operation."""
+    value = cv.string(value)
+    try:
+        socket.inet_pton(socket.AF_INET, value)
+    except OSError as exc:
+        raise vol.Invalid("Use the device's IPv4 address, not a hostname") from exc
+    return value
+
+
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+    {
+        vol.Required(CONF_HOST): ipv4_address,
+        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
+        vol.Optional(CONF_MAX_VOLUME, default=DEFAULT_MAX_VOLUME): cv.positive_int,
+        vol.Optional(
+            CONF_DEFAULT_STANDARD_ZONE, default=DEFAULT_STANDARD_ZONE
+        ): cv.positive_int,
+    }
+)
+
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
-  """Set up the Dynaudio platform"""
-  dynaudio = DynaudioEntity(
-    config.get(CONF_NAME), config.get(CONF_HOST), config.get(CONF_PORT), config.get(CONF_MAX_VOLUME), \
-      config.get(CONF_DEFAULT_STANDARD_ZONE))
-  if dynaudio.update():
-    add_entities([dynaudio])
+    """Set up the Dynaudio platform."""
+    add_entities(
+        [
+            DynaudioEntity(
+                config[CONF_NAME],
+                config[CONF_HOST],
+                config[CONF_PORT],
+                config[CONF_MAX_VOLUME],
+                config[CONF_DEFAULT_STANDARD_ZONE],
+            )
+        ]
+    )
+
 
 class DynaudioEntity(MediaPlayerEntity):
-  """Representation of a Dynaudio entity"""
+    """Representation of a Dynaudio device."""
 
-  def __init__(self, name, host, port, max_volume, standard_zone):
-    """Initialize the Dynaudio entity"""
-    self._name = name
-    self._host = host
-    self._port = port
-    self._max_volume = min(max_volume, 31)
-    self._zone = min(standard_zone, 3)
-    self._pwstate = False
-    self._volume = 0
-    self._muted = False
-    self._selected_source = ""
-    self._consecutive_connect_fails = 0
-    self._fails_before_off = 3
-    self._source_name_to_number = {"Minijack": 1, "Line": 2, "Optical": 3, "Coax": 4, "USB": 5, "Bluetooth": 6, "Stream": 7}
-    self._source_number_to_name = {1: "Minijack", 2: "Line", 3: "Optical", 4: "Coax", 5: "USB", 6: "Bluetooth", 7: "Stream"}
-    self.lock = threading.Lock()
+    def __init__(self, name, host, port, max_volume, standard_zone):
+        self._name = name
+        self._host = host
+        self._port = port
+        self._max_volume = min(max_volume, 31)
+        self._zone = min(standard_zone, 3)
 
-  def calculate_checksum(self, payload):
-    """Calculate the checksum for the complete command"""
-    hexarray = payload.split(" ")
-    sum = 0
-    for num in hexarray:
-        sum += int(num, 16)
-    x = math.ceil(sum / 255)
-    checksum = x * 255 - sum - (len(hexarray) - x)
-    return hex(checksum & 255)[2:]
+        self._pwstate = False
+        self._volume = 0.0
+        self._muted = False
+        self._selected_source = ""
+        self._available = False
+        self._consecutive_connect_fails = 0
+        self._lock = threading.Lock()
 
-  def construct_command(self, payload):
-    """Construct full command"""
-    prefix = "FF 55"
-    payload_size = str(len(payload.split(" "))).zfill(2)
-    checksum = self.calculate_checksum(payload)
-    return prefix + " " + payload_size + " " + payload + " " + checksum
+    @staticmethod
+    def calculate_checksum(payload):
+        """Calculate the checksum using the existing device protocol."""
+        values = [int(value, 16) for value in payload.split()]
+        total = sum(values)
+        x = math.ceil(total / 255)
+        checksum = x * 255 - total - (len(values) - x)
+        return f"{checksum & 0xFF:02X}"
 
-  def socket_command(self, payload):
-    """Establish a socket connection and sends command"""
-    self.lock.acquire()
-    try:
-      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(2)
-        s.connect((self._host, self._port))
-        hex_data = bytes.fromhex(self.construct_command(payload))
-        s.send(hex_data)
-        received = s.recv(1024)
-        if received != False:
-          """Update entity status"""
-          self._volume=float(min((int(received[7]) / self._max_volume),1))
-          self._selected_source=self._source_number_to_name[received[8]]
-          self._muted=bool(received[10])
-          self._pwstate=bool(received[6])
-          #if (int(received[3], 16) == int("2e", 16)) & (int(received[4], 16) == int("a0", 16)):
-          """if True:
-            _LOGGER.warning("Update trigger!")
-            r_zone = int(received[7]) % 10
-            r_input = int(received[7]) / 10
-            if (r_zone != self._zone):
-              _LOGGER.warning("Received feedback of wrong zone", r_zone)
-            else:
-              # always update source
-              self._selected_source = self._source_number_to_name[r_input]
-              # update power if possible
-              if (int(received[5]) == 1):
-                self._pwstate = True
-                _LOGGER.warning("Power on!")
-              elif (int(received[5]) == 2):
-                self._pwstate = False
-                _LOGGER.warning("Power off!")
-              # update volume if possible
-              elif (int(received[5]) == 4) or (int(received[5]) == 5):
-                _LOGGER.warning("Volume update")
-                self._volume = float(min((int(received[6]) / self._max_volume),1))
-              # update mute if possible
-              elif (int(received[5]) == 3):
-                _LOGGER.warning("Mote update!")
-                self._muted = bool(received[6], 16)"""
-        s.shutdown(socket.SHUT_RDWR)
-        s.close()
-    except (ConnectionRefusedError):
-      _LOGGER.info("%s refused connection", self._name)
-      return False
-    except (OSError):
-      self._consecutive_connect_fails += 1
-      if (self._consecutive_connect_fails >= self._fails_before_off):
-        self._pwstate=False
-      return False
-    finally:
-      self.lock.release()
-    self._consecutive_connect_fails = 0
+    def construct_command(self, payload):
+        """Construct a complete command."""
+        size = len(payload.split())
+        return f"FF 55 {size:02X} {payload} {self.calculate_checksum(payload)}"
 
-  def update(self):
-    """Hacky: send mute command to unused zone in order to receive feedback"""
-    """Assuming only one zone is in use"""
-    """Could be fixed by keeping socket open and implementing feedback command"""
-    mute_green = "2F A0 12 00 72"
-    mute_red = "2F A0 12 00 71"
-    if self._zone == 1:
-      payload = mute_green
-    else:
-      payload = mute_red
-      _LOGGER.warning("This should not occur as long as zone is red!")
-    self.socket_command(payload)
-    return True
+    def socket_command(self, payload, *, poll=False):
+        """Send a command; only a poll response determines device status."""
+        if not self._lock.acquire(timeout=LOCK_TIMEOUT):
+            _LOGGER.warning(
+                "%s: socket busy; skipped command rather than waiting indefinitely",
+                self._name,
+            )
+            return False
 
-  @property
-  def name(self):
-    """Return the name of the entity"""
-    return self._name
+        try:
+            command = bytes.fromhex(self.construct_command(payload))
 
-  @property
-  def state(self):
-    """Return the state of the entity"""
-    if self._pwstate:
-      return STATE_ON
-    else:
-      return STATE_OFF
+            with socket.create_connection(
+                (self._host, self._port), timeout=SOCKET_TIMEOUT
+            ) as sock:
+                sock.settimeout(SOCKET_TIMEOUT)
+                sock.sendall(command)
+                received = sock.recv(1024)
 
-  @property
-  def volume_level(self):
-    """Volume level of the media player (0..1)"""
-    return self._volume
+            if poll:
+                if len(received) < 11:
+                    raise ValueError(
+                        f"incomplete status response ({len(received)} bytes)"
+                    )
 
-  @property
-  def is_volume_muted(self):
-    """Boolean if volume is currently muted"""
-    return self._muted
+                source = SOURCE_NAMES.get(received[8])
+                if source is None:
+                    raise ValueError(f"unknown source number {received[8]}")
 
-  @property
-  def supported_features(self):
-    """Flag media player features that are supported"""
-    return SUPPORT_DYNAUDIO
+                self._volume = min(received[7] / self._max_volume, 1.0)
+                self._selected_source = source
+                self._muted = bool(received[10])
+                self._pwstate = bool(received[6])
+                self._consecutive_connect_fails = 0
+                self._available = True
 
-  @property
-  def source(self):
-    """Return the current input source"""
-    return self._selected_source
+            return True
 
-  @property
-  def source_list(self):
-    """List of available input sources"""
-    return list(self._source_name_to_number.keys())
+        except (OSError, ValueError) as exc:
+            if poll:
+                self._consecutive_connect_fails += 1
+                if self._consecutive_connect_fails >= 3:
+                    self._available = False
 
-  @property
-  def media_title(self):
-    """Title in Lovelace"""
-    if self._pwstate:
-      return self._selected_source
-    else:
-      return "Off"
+            _LOGGER.debug("%s: device command failed: %s", self._name, exc)
+            return False
 
-  def turn_off(self):
-    """Turn the media player off"""
-    self.socket_command("2F A0 02 01 F" + str(self._zone))
+        finally:
+            self._lock.release()
 
-  def turn_on(self):
-    """Turn the media player on"""
-    self.socket_command("2F A0 01 00 F" + str(self._zone))
 
-  def set_volume_level(self, volume):
-    """Set volume level, range 0..1"""
-    self.socket_command(
-      "2F A0 13 " +
-      str(hex(round(volume * self._max_volume))[2:]).zfill(2) +
-      " " + str(self._source_name_to_number[self._selected_source]) + str(self._zone))
+    def update(self):
+        """Poll using the existing unused-zone command workaround."""
+        payload = "2F A0 12 00 72" if self._zone == 1 else "2F A0 12 00 71"
+        self.socket_command(payload, poll=True)
 
-  def mute_volume(self, mute):
-    """Toggles mute of media player (regardless of bool mute)"""
-    self.socket_command("2F A0 12 01 3" + str(self._zone))
+    @property
+    def name(self):
+        return self._name
 
-  def select_source(self, source):
-    """Select input source"""
-    self.socket_command(
-      "2F A0 15 " +
-      str(self._source_name_to_number.get(source)).zfill(2) +
-      " " + str(self._source_name_to_number[self._selected_source]) + str(self._zone))
+    @property
+    def available(self):
+        return self._available
+
+    @property
+    def state(self):
+        return STATE_ON if self._pwstate else STATE_OFF
+
+    @property
+    def volume_level(self):
+        return self._volume
+
+    @property
+    def is_volume_muted(self):
+        return self._muted
+
+    @property
+    def supported_features(self):
+        return SUPPORT_DYNAUDIO
+
+    @property
+    def source(self):
+        return self._selected_source
+
+    @property
+    def source_list(self):
+        return list(SOURCES)
+
+    @property
+    def media_title(self):
+        return self._selected_source if self._pwstate else "Off"
+
+    def turn_off(self):
+        self.socket_command(f"2F A0 02 01 F{self._zone}")
+
+    def turn_on(self):
+        self.socket_command(f"2F A0 01 00 F{self._zone}")
+
+    def set_volume_level(self, volume):
+        current_source = SOURCES.get(self._selected_source)
+        if current_source is None:
+            _LOGGER.warning(
+                "%s: cannot set volume until a valid source has been read",
+                self._name,
+            )
+            return
+
+        level = round(max(0.0, min(volume, 1.0)) * self._max_volume)
+        self.socket_command(
+            f"2F A0 13 {level:02X} {current_source}{self._zone}"
+        )
+
+    def mute_volume(self, mute):
+        # The existing device command toggles mute; it does not set it.
+        if mute != self._muted:
+            self.socket_command(f"2F A0 12 01 3{self._zone}")
+
+    def select_source(self, source):
+        requested_source = SOURCES.get(source)
+        current_source = SOURCES.get(self._selected_source)
+        if requested_source is None or current_source is None:
+            _LOGGER.warning(
+                "%s: cannot select source without a valid requested and "
+                "current source",
+                self._name,
+            )
+            return
+
+        self.socket_command(
+            f"2F A0 15 {requested_source:02X} "
+            f"{current_source}{self._zone}"
+        )
